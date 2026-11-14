@@ -1,0 +1,37 @@
+# Environment
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Data lake (generated at runtime — do not commit)
+data/lake/
+data/checkpoints/
+
+# Airflow logs (generated at runtime)
+airflow/logs/
+
+# dbt
+dbt/target/
+dbt/logs/
+dbt/.user.yml
+
+# Spark ivy/maven cache
+.ivy2/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db

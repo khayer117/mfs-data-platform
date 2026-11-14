@@ -1,0 +1,252 @@
+# ── Airflow common anchor ────────────────────────────────────────────────────
+# All Airflow services inherit from this anchor.
+# Image is built from airflow/Dockerfile (adds Java + PySpark to official image).
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__API__SECRET_KEY: "${AIRFLOW_SECRET_KEY:-mfs-dev-secret-change-in-prod}"
+    AIRFLOW__API_AUTH__JWT_SECRET: "${AIRFLOW_SECRET_KEY:-mfs-dev-secret-change-in-prod}"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://airflow-apiserver:8080/execution/"
+    # Airflow connection for the MFS data warehouse (accessible as conn_id='mfs_dw')
+    AIRFLOW_CONN_MFS_DW: "postgresql://mfs:mfs@postgres-dw:5432/mfs_dw"
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./spark/jobs:/opt/spark-jobs    # batch job scripts
+    - ./data:/data                    # shared data lake
+  depends_on:
+    postgres-airflow:
+      condition: service_healthy
+
+services:
+
+  # ── Kafka (KRaft, no ZooKeeper) ──────────────────────────────────────────
+  kafka:
+    image: apache/kafka:4.3.2
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: CONTROLLER://kafka:9093,PLAINTEXT://kafka:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "kafka:29092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # One-shot: creates topics once Kafka is healthy, then exits.
+  init-kafka:
+    image: apache/kafka:4.3.2
+    container_name: init-kafka
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+          --create --if-not-exists \
+          --topic mfs.transactions \
+          --partitions 3 \
+          --replication-factor 1 \
+          --config retention.ms=604800000
+
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+          --create --if-not-exists \
+          --topic mfs.fraud_alerts \
+          --partitions 1 \
+          --replication-factor 1 \
+          --config retention.ms=604800000
+
+        echo "Topics created:"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --describe
+
+  # Browse topics and messages at http://localhost:8090
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8090:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local-mfs
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  # ── Spark standalone cluster ────────────────────────────────────────────
+  spark-master:
+    image: apache/spark:3.5.3
+    container_name: spark-master
+    hostname: spark-master
+    user: root
+    ports:
+      - "7077:7077"
+      - "8082:8080"   # Spark Master UI
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      SPARK_MASTER_WEBUI_PORT: 8080
+    volumes:
+      - ./data:/data
+      - ./spark/jobs:/opt/spark-jobs
+      - spark-packages:/root/.ivy2
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  spark-worker:
+    image: apache/spark:3.5.3
+    container_name: spark-worker
+    hostname: spark-worker
+    user: root
+    ports:
+      - "8083:8081"   # Spark Worker UI
+    entrypoint:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_WORKER_WEBUI_PORT: 8081
+    volumes:
+      - ./data:/data
+      - ./spark/jobs:/opt/spark-jobs
+      - spark-packages:/root/.ivy2
+    depends_on:
+      - spark-master
+
+  # ── PostgreSQL — MFS data warehouse ────────────────────────────────────
+  postgres-dw:
+    image: postgres:18
+    container_name: postgres-dw
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: mfs
+      POSTGRES_PASSWORD: mfs
+      POSTGRES_DB: mfs_dw
+    volumes:
+      - postgres-dw-data:/var/lib/postgresql
+      - ./sql/init_dw.sql:/docker-entrypoint-initdb.d/init_dw.sql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "mfs", "-d", "mfs_dw"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── PostgreSQL — Airflow metadata (not exposed to host) ─────────────────
+  postgres-airflow:
+    image: postgres:18
+    container_name: postgres-airflow
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-airflow-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── Airflow — initialise DB + create admin user (runs once then exits) ──
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin123 || true
+    restart: on-failure
+
+  # ── Airflow — API server + Web UI (http://localhost:8085) ────────────────
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
+    ports:
+      - "8085:8080"
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Airflow — scheduler (triggers task instances) ────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    restart: always
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Airflow — triggerer (for deferrable operators / async sensors) ───────
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    restart: always
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Airflow — DAG processor (parses .py DAG files) ──────────────────────
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    restart: always
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  kafka-data:
+  spark-packages:         # Maven/Ivy JAR cache for Spark packages
+  postgres-dw-data:       # MFS data warehouse data
+  postgres-airflow-data:  # Airflow metadata database
