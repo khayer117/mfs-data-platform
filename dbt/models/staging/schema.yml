@@ -1,0 +1,27 @@
+version: 2
+
+models:
+  - name: stg_transactions
+    description: "Thin view over silver.transactions — the single source of truth for all gold models."
+    columns:
+      - name: txn_id
+        description: "Unique transaction identifier."
+        tests:
+          - unique
+          - not_null
+      - name: txn_type
+        description: "Transaction type."
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['CASH_IN', 'CASH_OUT', 'SEND_MONEY', 'MERCHANT_PAY', 'BILL_PAY']
+      - name: sender_wallet
+        tests:
+          - not_null
+      - name: amount
+        description: "Transaction amount in BDT."
+        tests:
+          - not_null
+      - name: event_date
+        tests:
+          - not_null

@@ -17,11 +17,14 @@ x-airflow-common: &airflow-common
     # Airflow connection for the MFS data warehouse (accessible as conn_id='mfs_dw')
     AIRFLOW_CONN_MFS_DW: "postgresql://mfs:mfs@postgres-dw:5432/mfs_dw"
     JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+    PG_USER: mfs
+    PG_PASSWORD: mfs
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
     - ./spark/jobs:/opt/spark-jobs    # batch job scripts
     - ./data:/data                    # shared data lake
+    - ./dbt:/opt/dbt                  # dbt project
   depends_on:
     postgres-airflow:
       condition: service_healthy
@@ -199,7 +202,7 @@ services:
       - "8085:8080"
     restart: always
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
       interval: 30s
       timeout: 10s
       retries: 5

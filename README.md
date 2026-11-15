@@ -58,7 +58,7 @@ All data is **100% synthetic**. No real phone numbers, no real customers, no rea
 | **Bronze** | `data/lake/bronze/transactions/ingest_date=YYYY-MM-DD/` | Parquet | Raw JSON as-is + Kafka metadata. Never modified. |
 | **Silver** | `data/lake/silver/transactions/event_date=YYYY-MM-DD/` + PostgreSQL | Parquet + table | Typed, validated, deduplicated. One row per `txn_id`. |
 | **Quarantine** | `data/lake/quarantine/transactions/ingest_date=YYYY-MM-DD/` | Parquet | Records that failed validation, with `reject_reason`. |
-| **Gold** | PostgreSQL `analytics` schema | Tables | Dimensional model and marts, built and tested by dbt. |
+| **Gold** | PostgreSQL `gold` schema | Tables | Aggregations and marts built and tested by dbt. |
 
 ---
 
@@ -78,18 +78,32 @@ mini-mfs-data-platform/
 │   ├── producer.py
 │   ├── reference_data.py
 │   └── scenarios.py
-├── spark/                      # Component 3 — DONE  |  Component 4 — Week 3
+├── spark/                      # Component 3 — DONE  |  Component 4 — DONE
 │   └── jobs/
 │       ├── schemas.py          # shared PySpark schemas
 │       ├── stream_ingest.py    # streaming job (bronze + fraud alerts)
-│       └── bronze_to_silver.py # batch job (Week 3)
-├── sql/                        # Component 5 — Week 3
+│       └── bronze_to_silver.py # batch job
+├── sql/                        # Component 5 — DONE
 │   └── init_dw.sql
-├── airflow/                    # Component 7 — Week 3
+├── airflow/                    # Component 7 — DONE
+│   ├── Dockerfile              # custom image: Airflow + Java + PySpark + dbt
 │   └── dags/
 │       └── mfs_daily_pipeline.py
-├── dbt/                        # Component 6 — Week 4
-│   └── mfs_dbt/
+├── dbt/                        # Component 6 — DONE
+│   ├── dbt_project.yml
+│   ├── profiles.yml
+│   ├── macros/
+│   │   └── generate_schema_name.sql
+│   └── models/
+│       ├── staging/
+│       │   ├── sources.yml
+│       │   ├── stg_transactions.sql
+│       │   └── schema.yml
+│       └── gold/
+│           ├── daily_txn_summary.sql
+│           ├── wallet_activity.sql
+│           ├── district_heatmap.sql
+│           └── schema.yml
 └── data/                       # git-ignored — created by 'make init'
     ├── lake/
     │   ├── bronze/
@@ -138,11 +152,11 @@ mkdir -Force airflow/logs
 
 ### Step 2 — Build the Airflow image (once — takes ~5 min first time)
 
-```powershell
-docker compose build airflow-apiserver
+```bash
+make airflow-build
 ```
 
-Builds the custom Airflow image with Java + PySpark pre-installed. Only needs to re-run when [airflow/Dockerfile](airflow/Dockerfile) changes.
+Builds the custom Airflow image (Java + PySpark + dbt) for all Airflow services. Only needs to re-run when [airflow/Dockerfile](airflow/Dockerfile) changes.
 
 ### Step 3 — Start infrastructure
 
@@ -242,16 +256,38 @@ SELECT * FROM silver.batch_audit ORDER BY started_at DESC LIMIT 5;
 SELECT txn_id, COUNT(*) FROM silver.transactions GROUP BY txn_id HAVING COUNT(*) > 1;
 ```
 
-### Step 10 — Airflow (Week 3)
+### Step 10 — Airflow
 
 Open **http://localhost:8085**, log in with `admin` / `admin123`.
 
-Enable the `mfs_daily_pipeline` DAG. It runs daily at 01:00 UTC and processes each day's bronze data automatically.
+Enable the `mfs_daily_pipeline` DAG (toggle the pause switch). It runs daily at 01:00 UTC and processes each day's bronze data automatically through all 5 tasks:
+
+```
+wait_for_bronze → bronze_to_silver → load_silver → dbt_build → publish_audit
+```
 
 Manual trigger for a specific date:
 
-```powershell
-docker compose exec airflow-scheduler airflow dags trigger mfs_daily_pipeline --logical-date 2026-11-09
+```bash
+make trigger D=2026-11-09
+```
+
+### Step 11 — Run dbt manually (optional)
+
+Run dbt models and tests outside of Airflow for quick development iteration:
+
+```bash
+make dbt-run      # build staging views + gold tables
+make dbt-test     # run all schema tests
+make dbt-docs     # generate docs (output: dbt/target/index.html)
+```
+
+Verify gold tables in PostgreSQL:
+
+```sql
+SELECT * FROM gold.daily_txn_summary  ORDER BY event_date DESC LIMIT 10;
+SELECT * FROM gold.wallet_activity    ORDER BY total_sent   DESC LIMIT 10;
+SELECT * FROM gold.district_heatmap   ORDER BY txn_count    DESC LIMIT 10;
 ```
 
 ---
@@ -368,17 +404,21 @@ Set `FRAUD_ENABLED=false` to disable all fraud patterns (cleaner data for batch 
 Requires `make` (Git Bash). All targets are plain commands if `make` is not available.
 
 ```bash
-make init             # create data/ and airflow/logs directories (run once)
-make airflow-build    # build custom Airflow image (run once after clone)
-make up               # docker compose up -d
-make down             # stop containers (data volumes kept)
-make topics           # describe all Kafka topics
-make logs             # tail Kafka container logs
-make gen              # run generator with .env settings
-make gen-load         # 500 events/sec, 5000 messages, seed=0
-make stream           # submit the Spark streaming job
-make batch D=YYYY-MM-DD  # run bronze→silver for one date
-make reset            # wipe Kafka + Spark data volumes (asks for confirmation)
+make init                # create data/ and airflow/logs directories (run once)
+make airflow-build       # build custom Airflow image for all services (run once after clone)
+make up                  # docker compose up -d
+make down                # stop containers (data volumes kept)
+make topics              # describe all Kafka topics
+make logs                # tail Kafka container logs
+make gen                 # run generator with .env settings
+make gen-load            # 500 events/sec, 5000 messages, seed=0
+make stream              # submit the Spark streaming job
+make batch D=YYYY-MM-DD  # run bronze→silver batch job for one date
+make trigger D=YYYY-MM-DD # trigger mfs_daily_pipeline DAG for a specific date
+make dbt-run             # run all dbt models (staging views + gold tables)
+make dbt-test            # run all dbt schema tests
+make dbt-docs            # generate dbt documentation (dbt/target/index.html)
+make reset               # wipe Kafka + Spark data volumes (asks for confirmation)
 ```
 
 ---
@@ -402,14 +442,17 @@ make reset            # wipe Kafka + Spark data volumes (asks for confirmation)
 - [x] `bronze_to_silver.py` — parse, validate, quarantine, dedupe, write silver Parquet + PostgreSQL
 - [x] `sql/init_dw.sql` — `silver.transactions` (PK), `transactions_stage`, `batch_audit`, `fraud_alerts`
 - [x] PostgreSQL DW (`postgres-dw`) + Airflow in `docker-compose.yml`
-- [x] `mfs_daily_pipeline` DAG — wait_for_bronze → bronze_to_silver → load_silver → dbt_build (placeholder) → publish_audit
+- [x] `mfs_daily_pipeline` DAG — wait_for_bronze → bronze_to_silver → load_silver → dbt_build → publish_audit
 - [ ] `silver.transactions` verified: no duplicate `txn_id`, audit arithmetic correct
 - [ ] Airflow DAG runs end-to-end for one day
 - [ ] Rerunning the same day leaves row counts unchanged (idempotency proof)
 
 ### Week 4 — dbt + Superset
-- [ ] All dbt models build; all tests pass
-- [ ] `fct_transactions` row count equals `silver.transactions`
+- [x] dbt project scaffolded: `dbt_project.yml`, `profiles.yml`, `generate_schema_name` macro
+- [x] Staging model: `stg_transactions` (view over `silver.transactions`)
+- [x] Gold models: `daily_txn_summary`, `wallet_activity`, `district_heatmap` (tables in `gold` schema)
+- [x] Schema tests: `unique`, `not_null`, `accepted_values` on key columns — all pass
+- [x] dbt wired into Airflow `dbt_build` task (full path, `--no-use-colors`)
 - [ ] Apache Superset dashboards on gold tables
 - [ ] dbt lineage graph screenshot in this README
 

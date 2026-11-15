@@ -6,8 +6,8 @@
 -- Schemas
 -- ---------------------------------------------------------------------------
 CREATE SCHEMA IF NOT EXISTS silver;
-CREATE SCHEMA IF NOT EXISTS analytics_staging;
-CREATE SCHEMA IF NOT EXISTS analytics;
+CREATE SCHEMA IF NOT EXISTS staging;   -- dbt staging views
+CREATE SCHEMA IF NOT EXISTS gold;      -- dbt gold tables (dashboards / analytics)
 
 -- ---------------------------------------------------------------------------
 -- silver.transactions — one row per unique txn_id, the source of truth.

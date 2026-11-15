@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  - name: silver
+    schema: silver
+    description: "Cleaned, deduplicated transactions written by the Spark batch job."
+    tables:
+      - name: transactions
+        description: "One row per unique txn_id after validation and deduplication."

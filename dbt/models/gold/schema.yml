@@ -1,0 +1,73 @@
+version: 2
+
+models:
+  - name: daily_txn_summary
+    description: "Daily transaction volume and revenue aggregated by transaction type."
+    columns:
+      - name: event_date
+        description: "Calendar date of the transactions."
+        tests:
+          - not_null
+      - name: txn_type
+        description: "Transaction type (CASH_IN, CASH_OUT, SEND_MONEY, MERCHANT_PAY, BILL_PAY)."
+        tests:
+          - not_null
+      - name: txn_count
+        description: "Number of transactions on this date for this type."
+        tests:
+          - not_null
+      - name: total_amount
+        description: "Sum of all transaction amounts in BDT."
+      - name: total_fee
+        description: "Sum of all fees collected in BDT."
+      - name: avg_amount
+        description: "Average transaction amount in BDT."
+      - name: unique_senders
+        description: "Number of distinct sender wallets active on this date for this type."
+      - name: active_districts
+        description: "Number of distinct districts with transactions on this date for this type."
+
+  - name: wallet_activity
+    description: "Lifetime activity stats per sender wallet — total sent, fee paid, active date range."
+    columns:
+      - name: wallet_id
+        description: "Sender wallet identifier."
+        tests:
+          - unique
+          - not_null
+      - name: txn_sent_count
+        description: "Total number of transactions sent."
+        tests:
+          - not_null
+      - name: total_sent
+        description: "Lifetime total amount sent in BDT."
+      - name: total_fee_paid
+        description: "Lifetime total fees paid in BDT."
+      - name: avg_txn_amount
+        description: "Average transaction amount in BDT."
+      - name: first_txn_date
+        description: "Date of the wallet's first recorded transaction."
+      - name: last_txn_date
+        description: "Date of the wallet's most recent transaction."
+      - name: distinct_txn_types
+        description: "Number of distinct transaction types used by this wallet."
+
+  - name: district_heatmap
+    description: "Transaction volume by district, date, and type — feeds the geographic dashboard."
+    columns:
+      - name: district
+        description: "District name; 'Unknown' when district is null in source data."
+        tests:
+          - not_null
+      - name: event_date
+        description: "Calendar date of the transactions."
+        tests:
+          - not_null
+      - name: txn_type
+        description: "Transaction type."
+      - name: txn_count
+        description: "Number of transactions in this district on this date for this type."
+      - name: total_amount
+        description: "Sum of all transaction amounts in BDT."
+      - name: avg_amount
+        description: "Average transaction amount in BDT."

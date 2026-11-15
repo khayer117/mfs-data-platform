@@ -3,7 +3,7 @@
 
 PYTHON := .venv/Scripts/python.exe
 
-.PHONY: up down topics logs gen gen-load init stream reset batch trigger airflow-build airflow-init
+.PHONY: up down topics logs gen gen-load init stream reset batch trigger airflow-build airflow-init dbt-run dbt-test dbt-docs
 
 ## Create required data lake and Airflow directories (run once)
 init:
@@ -64,9 +64,24 @@ trigger:
 	docker compose exec airflow-scheduler airflow dags trigger mfs_daily_pipeline \
 	  --logical-date $(D)
 
-## Build the custom Airflow image (run after first clone or when Dockerfile changes)
+## Run dbt models (staging views + gold tables)
+dbt-run:
+	MSYS_NO_PATHCONV=1 docker compose exec airflow-scheduler \
+	  /home/airflow/.local/bin/dbt run --project-dir /opt/dbt --profiles-dir /opt/dbt --no-use-colors
+
+## Run dbt schema tests
+dbt-test:
+	MSYS_NO_PATHCONV=1 docker compose exec airflow-scheduler \
+	  /home/airflow/.local/bin/dbt test --project-dir /opt/dbt --profiles-dir /opt/dbt --no-use-colors
+
+## Generate dbt docs (then view at dbt/target/index.html)
+dbt-docs:
+	MSYS_NO_PATHCONV=1 docker compose exec airflow-scheduler \
+	  /home/airflow/.local/bin/dbt docs generate --project-dir /opt/dbt --profiles-dir /opt/dbt --no-use-colors
+
+## Build the custom Airflow image for all services (run after first clone or Dockerfile changes)
 airflow-build:
-	docker compose build airflow-apiserver
+	docker compose build airflow-apiserver airflow-scheduler airflow-triggerer airflow-dag-processor
 
 ## Full reset: stop containers, wipe Kafka volume, checkpoints, and bronze files (destructive)
 ## Use after manually clearing Kafka so checkpoints and offsets stay in sync.

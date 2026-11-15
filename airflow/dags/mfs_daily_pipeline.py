@@ -100,11 +100,17 @@ def mfs_daily_pipeline():
     )
 
     # ------------------------------------------------------------------
-    # Task 4 (placeholder): dbt build — Week 4
+    # Task 4: dbt build — staging views + gold tables + schema tests
+    # Runs inside the Airflow container where dbt-postgres is installed.
     # ------------------------------------------------------------------
     dbt_build = BashOperator(
         task_id="dbt_build",
-        bash_command="echo '[dbt_build] Not yet implemented — Week 4 milestone'",
+        bash_command=(
+            "/home/airflow/.local/bin/dbt build "
+            "--project-dir /opt/dbt "
+            "--profiles-dir /opt/dbt "
+            "--no-use-colors"
+        ),
     )
 
     # ------------------------------------------------------------------

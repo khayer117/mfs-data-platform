@@ -1,0 +1,12 @@
+mfs:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: postgres-dw
+      port: 5432
+      user: "{{ env_var('PG_USER', 'mfs') }}"
+      password: "{{ env_var('PG_PASSWORD', 'mfs') }}"
+      dbname: mfs_dw
+      schema: public      # fallback; each model overrides via +schema in dbt_project.yml
+      threads: 2
