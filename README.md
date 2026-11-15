@@ -4,6 +4,8 @@ A hands-on data engineering project built around a realistic **Mobile Financial 
 
 All data is **100% synthetic**. No real phone numbers, no real customers, no real money.
 
+> **Version 2 roadmap** — incremental fact table, dimensional models (`dim_wallet`, `dim_agent`), agent liquidity mart, R3 pass-through fraud detection (batch), and pytest unit tests are planned but not yet implemented. See [spec/mini-mfs-data-platform-spec-v2.md](spec/mini-mfs-data-platform-spec-v2.md).
+
 ---
 
 ## Architecture
@@ -11,13 +13,12 @@ All data is **100% synthetic**. No real phone numbers, no real customers, no rea
 ```
 ┌─────────────────────────┐
 │  Transaction Generator  │  Python · ~20 events/sec · injects dirty data
-│  (runs locally)         │
 └───────────┬─────────────┘
             │ JSON  key = sender_wallet
             ▼
 ┌─────────────────────────┐
 │  Kafka 4.3.2 (KRaft)    │  topic: mfs.transactions  (3 partitions)
-│  (Docker)               │  topic: mfs.fraud_alerts  (1 partition)
+│                         │  topic: mfs.fraud_alerts  (1 partition)
 └───────────┬─────────────┘
             ▼
 ┌──────────────────────────────────────────────────────┐
@@ -26,26 +27,26 @@ All data is **100% synthetic**. No real phone numbers, no real customers, no rea
 │   Query B1: R1_VELOCITY ──► Kafka mfs.fraud_alerts   │
 │   Query B2: R2_LARGE_CASHOUT ──► Kafka + Bronze      │
 └───────────┬──────────────────────────────────────────┘
-            │
             ▼
 ┌──────────────────────────────────────────────────────┐
-│  Airflow DAG: mfs_daily_pipeline  (daily)            │
-│   1. Spark batch: bronze ──► SILVER (clean, deduped) │
-│   2. Load silver ──► PostgreSQL                      │
-│   3. dbt build: silver ──► GOLD (facts, dims, marts) │
-│   4. dbt tests                                       │
+│  Airflow DAG: mfs_daily_pipeline  (daily 01:00 UTC)  │
+│   1. Sensor: wait for bronze partition               │
+│   2. Spark batch: bronze ──► SILVER (clean, deduped) │
+│   3. SQL upsert: silver ──► PostgreSQL               │
+│   4. dbt build: silver ──► GOLD                      │
+│   5. Publish audit summary                           │
 └───────────┬──────────────────────────────────────────┘
             ▼
 ┌─────────────────────────┐
-│  PostgreSQL Warehouse   │  schemas: silver · analytics (gold)
-└─────────────────────────┘
+│  PostgreSQL Warehouse   │  schemas: silver · staging · gold
+└───────────┬─────────────┘
             ▼
 ┌─────────────────────────┐
-│  Apache Superset        │  dashboards on gold tables (Week 4)
+│  Apache Superset        │  dashboards on gold tables (http://localhost:8088)
 └─────────────────────────┘
 ```
 
-**Two paths:**
+**Two paths through the system:**
 - **Hot path (seconds):** generator → Kafka → Spark streaming → fraud alerts
 - **Cold path (daily):** bronze → silver → gold, orchestrated by Airflow
 
@@ -56,7 +57,7 @@ All data is **100% synthetic**. No real phone numbers, no real customers, no rea
 | Layer | Location | Format | Rule |
 |---|---|---|---|
 | **Bronze** | `data/lake/bronze/transactions/ingest_date=YYYY-MM-DD/` | Parquet | Raw JSON as-is + Kafka metadata. Never modified. |
-| **Silver** | `data/lake/silver/transactions/event_date=YYYY-MM-DD/` + PostgreSQL | Parquet + table | Typed, validated, deduplicated. One row per `txn_id`. |
+| **Silver** | `data/lake/silver/transactions/event_date=YYYY-MM-DD/` + PostgreSQL `silver` schema | Parquet + table | Typed, validated, deduplicated. One row per `txn_id`. |
 | **Quarantine** | `data/lake/quarantine/transactions/ingest_date=YYYY-MM-DD/` | Parquet | Records that failed validation, with `reject_reason`. |
 | **Gold** | PostgreSQL `gold` schema | Tables | Aggregations and marts built and tested by dbt. |
 
@@ -65,31 +66,29 @@ All data is **100% synthetic**. No real phone numbers, no real customers, no rea
 ## Repository Structure
 
 ```
-mini-mfs-data-platform/
-├── docker-compose.yml          # Kafka + Spark + (Airflow, PostgreSQL, Superset later)
-├── Makefile                    # convenience targets (requires make in Git Bash)
+mfs-data-platform/
+├── docker-compose.yml          # all services
+├── Makefile                    # convenience targets
 ├── .env.example                # generator config template
-├── README.md
 ├── spec/
-│   ├── mini-mfs-data-platform-spec.md
+│   ├── mini-mfs-data-platform-spec.md    # v1 specification
+│   ├── mini-mfs-data-platform-spec-v2.md # v2 roadmap
 │   └── kafka-basics-reference.md
-├── generator/                  # Component 1 — DONE
-│   ├── requirements.txt
-│   ├── producer.py
-│   ├── reference_data.py
-│   └── scenarios.py
-├── spark/                      # Component 3 — DONE  |  Component 4 — DONE
-│   └── jobs/
-│       ├── schemas.py          # shared PySpark schemas
-│       ├── stream_ingest.py    # streaming job (bronze + fraud alerts)
-│       └── bronze_to_silver.py # batch job
-├── sql/                        # Component 5 — DONE
-│   └── init_dw.sql
-├── airflow/                    # Component 7 — DONE
-│   ├── Dockerfile              # custom image: Airflow + Java + PySpark + dbt
+├── generator/
+│   ├── producer.py             # Kafka producer
+│   ├── reference_data.py       # wallets, agents, merchants
+│   └── scenarios.py            # duplicate/late/fraud injection
+├── spark/jobs/
+│   ├── schemas.py              # shared PySpark schema
+│   ├── stream_ingest.py        # streaming job (bronze + fraud alerts)
+│   └── bronze_to_silver.py     # daily batch job
+├── sql/
+│   └── init_dw.sql             # PostgreSQL DDL (runs on first container start)
+├── airflow/
+│   ├── Dockerfile              # Airflow + Java 17 + PySpark + dbt
 │   └── dags/
 │       └── mfs_daily_pipeline.py
-├── dbt/                        # Component 6 — DONE
+├── dbt/
 │   ├── dbt_project.yml
 │   ├── profiles.yml
 │   ├── macros/
@@ -104,14 +103,11 @@ mini-mfs-data-platform/
 │           ├── wallet_activity.sql
 │           ├── district_heatmap.sql
 │           └── schema.yml
+├── superset/
+│   └── superset_config.py
 └── data/                       # git-ignored — created by 'make init'
-    ├── lake/
-    │   ├── bronze/
-    │   │   ├── transactions/   # Parquet, partitioned by ingest_date
-    │   │   └── fraud_alerts/   # Parquet, partitioned by ingest_date
-    │   ├── silver/
-    │   └── quarantine/
-    └── checkpoints/            # Spark streaming checkpoints
+    ├── lake/{bronze,silver,quarantine}/
+    └── checkpoints/
 ```
 
 ---
@@ -121,146 +117,123 @@ mini-mfs-data-platform/
 | Tool | Version | Notes |
 |---|---|---|
 | Docker Desktop | latest | must be running |
-| Python | 3.11+ | for the local generator (3.14 tested and working) |
+| Python | 3.11+ | for the local generator |
 | make | any | Git Bash on Windows; optional — all targets are plain commands |
 
 ---
 
 ## Services
 
-| Service | URL | Notes |
+| Service | URL | Credentials |
 |---|---|---|
-| Kafka broker | `localhost:9092` | generator connects here |
-| Kafka UI | http://localhost:8090 | browse topics and messages |
-| Spark Master UI | http://localhost:8082 | view running jobs |
-| Spark Worker UI | http://localhost:8083 | view worker resources |
-| PostgreSQL DW | `localhost:5432` | database `mfs_dw`, user `mfs` / password `mfs` |
-| Airflow UI | http://localhost:8085 | DAG management (admin / admin123) |
+| Kafka UI | http://localhost:8090 | — |
+| Spark Master UI | http://localhost:8082 | — |
+| Spark Worker UI | http://localhost:8083 | — |
+| Airflow UI | http://localhost:8085 | admin / admin123 |
+| Superset UI | http://localhost:8088 | admin / admin123 |
+| PostgreSQL DW | `localhost:5432` | mfs / mfs (db: `mfs_dw`) |
 
 ---
 
 ## Quick Start
 
-### Step 1 — Create data directories (once)
+### Step 1 — Create data directories
 
-```powershell
-mkdir -Force data/lake/bronze/transactions, data/lake/bronze/fraud_alerts
-mkdir -Force data/lake/silver/transactions, data/lake/quarantine/transactions
-mkdir -Force data/checkpoints
-mkdir -Force airflow/logs
+```bash
+make init
 ```
 
-### Step 2 — Build the Airflow image (once — takes ~5 min first time)
+### Step 2 — Build the custom Airflow image
 
 ```bash
 make airflow-build
 ```
 
-Builds the custom Airflow image (Java + PySpark + dbt) for all Airflow services. Only needs to re-run when [airflow/Dockerfile](airflow/Dockerfile) changes.
+Builds the custom image (Airflow + Java 17 + PySpark + dbt) for all Airflow services. Takes ~5 minutes on first run. Re-run only when [airflow/Dockerfile](airflow/Dockerfile) changes.
 
-### Step 3 — Start infrastructure
+### Step 3 — Start all services
 
-```powershell
-docker compose up -d
+```bash
+make up
 ```
 
-Starts Kafka, Spark, Kafka UI, PostgreSQL (warehouse + Airflow metadata), and all Airflow services. Topics are created automatically by `init-kafka`.
+Starts Kafka, Spark, PostgreSQL, Airflow, and Superset. Kafka topics and the PostgreSQL schema are created automatically.
 
 ### Step 4 — Install generator dependencies
 
-```powershell
-.venv\Scripts\pip install -r generator\requirements.txt
+```bash
+python -m venv .venv
+.venv\Scripts\pip install -r generator\requirements.txt   # Windows
+# source .venv/bin/activate && pip install -r generator/requirements.txt  # Mac/Linux
 ```
 
 ### Step 5 — Configure
 
-```powershell
-copy .env.example .env
+```bash
+copy .env.example .env    # Windows
+# cp .env.example .env   # Mac/Linux
 ```
 
 Defaults work out of the box. See [Configuration](#configuration) to adjust.
 
-### Step 6 — Start the generator (Terminal 1)
+### Step 6 — Start the transaction generator (Terminal 1)
 
-```powershell
+```bash
 # Sanity check — 100 messages then stop
-$env:MAX_MESSAGES=100; .venv\Scripts\python generator\producer.py
+MAX_MESSAGES=100 .venv/Scripts/python generator/producer.py
 
 # Run continuously
-.venv\Scripts\python generator\producer.py
+.venv/Scripts/python generator/producer.py
 ```
 
 Verify messages in Kafka UI → **http://localhost:8090** → Topics → `mfs.transactions`.
 
-### Step 7 — Start the streaming job (Terminal 2)
+### Step 7 — Start the Spark streaming job (Terminal 2)
 
-```powershell
-docker compose exec spark-master /opt/spark/bin/spark-submit `
-  --master spark://spark-master:7077 `
-  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3 `
-  --py-files /opt/spark-jobs/schemas.py `
-  /opt/spark-jobs/stream_ingest.py
+```bash
+make stream
 ```
 
 First run downloads the Kafka connector JAR (~10 MB, cached after that). After ~30 seconds the first micro-batch runs and Parquet files appear in `data/lake/bronze/`.
 
 ### Step 8 — Verify bronze files
 
-```powershell
-# Check files exist
-ls data\lake\bronze\transactions\
+```bash
+# Check partition folders exist
+ls data/lake/bronze/transactions/
 
-# Count rows via PySpark shell
+# Count rows in PySpark shell
 docker compose exec spark-master /opt/spark/bin/pyspark --master spark://spark-master:7077
 ```
 
 ```python
-# Inside PySpark shell
 df = spark.read.parquet("/data/lake/bronze/transactions")
-df.count()
 df.groupBy("ingest_date").count().show()
 ```
 
-### Step 9 — Run the batch job (Week 3)
+### Step 9 — Run the batch job manually
 
 After bronze files exist for a date, run the bronze → silver batch job:
 
-```powershell
-# Using Makefile (D = the ingest_date to process)
+```bash
 make batch D=2026-11-09
-
-# Without make
-docker compose exec spark-master /opt/spark/bin/spark-submit `
-  --master spark://spark-master:7077 `
-  --packages org.postgresql:postgresql:42.7.3 `
-  --py-files /opt/spark-jobs/schemas.py `
-  /opt/spark-jobs/bronze_to_silver.py `
-  --ingest-date 2026-11-09
 ```
 
-Verify results:
-
-```powershell
-# Silver Parquet files
-ls data\lake\silver\transactions\
-
-# PostgreSQL — connect with any client (DBeaver, psql, etc.)
-# Host: localhost:5432  DB: mfs_dw  User: mfs  Password: mfs
-```
+Verify results in PostgreSQL (DBeaver, psql, or any SQL client at `localhost:5432`):
 
 ```sql
 SELECT COUNT(*) FROM silver.transactions;
 SELECT * FROM silver.batch_audit ORDER BY started_at DESC LIMIT 5;
 
--- Idempotency check: run the batch job twice and re-run this — count must not change
+-- Idempotency check: re-run the batch and confirm count does not change
 SELECT txn_id, COUNT(*) FROM silver.transactions GROUP BY txn_id HAVING COUNT(*) > 1;
 ```
 
-### Step 10 — Airflow
+### Step 10 — Airflow pipeline
 
 Open **http://localhost:8085**, log in with `admin` / `admin123`.
 
-Enable the `mfs_daily_pipeline` DAG (toggle the pause switch). It runs daily at 01:00 UTC and processes each day's bronze data automatically through all 5 tasks:
+Enable the `mfs_daily_pipeline` DAG (toggle the pause switch). It runs daily at 01:00 UTC and processes each day's bronze data through 5 tasks automatically:
 
 ```
 wait_for_bronze → bronze_to_silver → load_silver → dbt_build → publish_audit
@@ -272,17 +245,43 @@ Manual trigger for a specific date:
 make trigger D=2026-11-09
 ```
 
-### Step 11 — Run dbt manually (optional)
+After the DAG completes, the gold tables are populated and ready for Superset.
 
-Run dbt models and tests outside of Airflow for quick development iteration:
+### Step 11 — Superset dashboards
+
+Open **http://localhost:8088**, log in with `admin` / `admin123`.
+
+The `MFS Data Warehouse` PostgreSQL connection is pre-registered. Build charts from the gold tables:
+
+| Chart | Table | Type |
+|---|---|---|
+| Transaction volume over time | `gold.daily_txn_summary` | Line chart: `total_amount` by `event_date`, colored by `txn_type` |
+| Transaction count by type | `gold.daily_txn_summary` | Bar chart: `txn_count` grouped by `txn_type` |
+| Top wallets by volume | `gold.wallet_activity` | Table: top 20 by `total_sent` DESC |
+| District activity | `gold.district_heatmap` | Bar chart: `txn_count` by `district` |
+
+Create a **Dashboards** → `+ Dashboard`, drag all 4 charts in, and save as "MFS Operations".
+
+---
+
+## dbt Models
+
+dbt runs as `dbt_build` (Task 4) inside the Airflow pipeline. It can also be run independently:
 
 ```bash
 make dbt-run      # build staging views + gold tables
 make dbt-test     # run all schema tests
-make dbt-docs     # generate docs (output: dbt/target/index.html)
+make dbt-docs     # generate lineage docs (output: dbt/target/index.html)
 ```
 
-Verify gold tables in PostgreSQL:
+| Model | Schema | Type | Description |
+|---|---|---|---|
+| `stg_transactions` | `staging` | View | Thin wrapper over `silver.transactions` |
+| `daily_txn_summary` | `gold` | Table | Volume by day and transaction type |
+| `wallet_activity` | `gold` | Table | Lifetime stats per sender wallet |
+| `district_heatmap` | `gold` | Table | Volume by district, date, and type |
+
+Verify gold tables:
 
 ```sql
 SELECT * FROM gold.daily_txn_summary  ORDER BY event_date DESC LIMIT 10;
@@ -294,50 +293,41 @@ SELECT * FROM gold.district_heatmap   ORDER BY txn_count    DESC LIMIT 10;
 
 ## Streaming Queries
 
-The streaming job (`spark/jobs/stream_ingest.py`) runs three continuous queries:
+The streaming job runs three continuous micro-batch queries (trigger: every 30 seconds):
 
-| Query | Input | Output | Trigger |
-|---|---|---|---|
-| **A — Bronze** | `mfs.transactions` | `data/lake/bronze/transactions/` Parquet | every 30s |
-| **B1 — R1_VELOCITY** | parsed transactions | `mfs.fraud_alerts` Kafka + `data/lake/bronze/fraud_alerts/` | every 30s |
-| **B2 — R2_LARGE_CASHOUT** | parsed transactions | `mfs.fraud_alerts` Kafka + `data/lake/bronze/fraud_alerts/` | every 30s |
+| Query | Input | Output |
+|---|---|---|
+| **A — Bronze** | `mfs.transactions` | `data/lake/bronze/transactions/` Parquet |
+| **B1 — R1_VELOCITY** | parsed transactions | `mfs.fraud_alerts` Kafka + bronze fraud_alerts Parquet |
+| **B2 — R2_LARGE_CASHOUT** | parsed transactions | `mfs.fraud_alerts` Kafka + bronze fraud_alerts Parquet |
 
-**Fraud rules:**
+**Fraud detection rules:**
 
 | Rule | Logic |
 |---|---|
 | `R1_VELOCITY` | >5 transactions from the same `sender_wallet` in a 1-minute tumbling window |
 | `R2_LARGE_CASHOUT` | `txn_type = CASH_OUT` and `amount > ৳25,000` |
 
-**Stop → Resume:** Spark saves Kafka offsets to `data/checkpoints/` every trigger. Restart the job and it resumes from where it left off — no gaps, no duplicate files.
+**Checkpoint behaviour:** Spark saves Kafka offsets to `data/checkpoints/` on every trigger. Restart the job and it resumes from where it stopped — no gaps, no reprocessed messages.
 
 ---
 
 ## Configuration
 
-All settings are environment variables. Copy `.env.example` to `.env` and edit.
+Copy `.env.example` to `.env` and edit. All variables have working defaults.
 
 | Variable | Default | Description |
 |---|---|---|
 | `KAFKA_BOOTSTRAP` | `localhost:9092` | Kafka broker address |
 | `TOPIC` | `mfs.transactions` | Target topic |
 | `EVENTS_PER_SECOND` | `20` | Target produce rate |
-| `DUPLICATE_RATE` | `0.02` | 2% of messages re-sent 0.1–5s later |
-| `LATE_RATE` | `0.03` | 3% of events have `event_time` 1–48h in the past |
-| `MALFORMED_RATE` | `0.01` | 1% corrupted (null amount, negative amount, bad type, missing ID) |
-| `FRAUD_ENABLED` | `true` | Enable velocity bursts, large cash-outs, pass-through patterns |
-| `SEED` | `42` | Seed for reproducibility. Change for independent load-test runs. |
-| `MAX_MESSAGES` | `0` | Stop after N messages. `0` = run forever. |
-| `LOG_EVERY` | `500` | Print a stats line every N messages. |
-
-**Load testing:**
-
-```powershell
-$env:EVENTS_PER_SECOND=500; $env:MAX_MESSAGES=10000; $env:SEED=99
-.venv\Scripts\python generator\producer.py
-```
-
-For rates above ~500/sec, run two PowerShell windows simultaneously.
+| `DUPLICATE_RATE` | `0.02` | Fraction of messages re-sent 0–5 seconds later |
+| `LATE_RATE` | `0.03` | Fraction of events with `event_time` 1–48 hours in the past |
+| `MALFORMED_RATE` | `0.01` | Fraction of records corrupted (null amount, bad type, missing ID) |
+| `FRAUD_ENABLED` | `true` | Enable velocity bursts and large cash-out patterns |
+| `SEED` | `42` | RNG seed for reproducibility |
+| `MAX_MESSAGES` | `0` | Stop after N messages (`0` = run forever) |
+| `LOG_EVERY` | `500` | Print a stats line every N messages |
 
 ---
 
@@ -348,31 +338,24 @@ For rates above ~500/sec, run two PowerShell windows simultaneously.
 | `mfs.transactions` | 3 | 7 days | `sender_wallet` |
 | `mfs.fraud_alerts` | 1 | 7 days | `sender_wallet` |
 
-**Why `sender_wallet` as the key?** All transactions from one wallet land on the same partition, preserving order. The streaming fraud rules (velocity, pass-through) depend on per-wallet ordering.
-
-**Network listeners:**
-
-| Listener | Address | Used by |
-|---|---|---|
-| `PLAINTEXT_HOST` | `localhost:9092` | Generator (runs on host) |
-| `PLAINTEXT` | `kafka:29092` | Spark, Kafka UI (run in Docker) |
+`sender_wallet` is the message key so all transactions from one wallet land on the same partition, preserving per-wallet order that the streaming fraud rules depend on.
 
 ---
 
 ## Injected Data Problems
 
-The generator deliberately injects problems so downstream components have real work to do.
+The generator deliberately injects problems so each pipeline layer has real work to do.
 
-| Problem | Rate | What it tests |
+| Problem | Rate | Handled by |
 |---|---|---|
-| Duplicates | 2% | Deduplication in Spark batch (`ROW_NUMBER`) and upsert in PostgreSQL |
-| Late events | 3% | Event-time partitioning in silver; 3-day lookback in dbt incremental model |
-| Malformed records | 1% | Validation and quarantine in `bronze_to_silver.py` |
-| Velocity fraud | ~0.3% | Spark streaming R1: >5 txns from one wallet in 1 minute |
+| Duplicates | 2% | `ROW_NUMBER` dedupe in Spark batch + `ON CONFLICT DO NOTHING` in PostgreSQL |
+| Late events | 3% | Event-time partitioning in silver (late row lands in correct `event_date` partition) |
+| Malformed records | 1% | Validation + quarantine in `bronze_to_silver.py` |
+| Velocity fraud | ~0.3% wallets | Spark streaming R1: >5 txns from one wallet in 1 minute |
 | Large cash-out | ~0.1% | Spark streaming R2: CASH_OUT > ৳25,000 |
-| Pass-through (mule) | ~0.1% | Batch R3 in dbt: receive SEND_MONEY → CASH_OUT ≥90% within 2 min |
+| Pass-through (mule) | ~0.1% | Generator injects pattern; batch R3 detection planned in v2 |
 
-Set `FRAUD_ENABLED=false` to disable all fraud patterns (cleaner data for batch testing).
+Set `FRAUD_ENABLED=false` to disable all fraud patterns.
 
 ---
 
@@ -401,64 +384,30 @@ Set `FRAUD_ENABLED=false` to disable all fraud patterns (cleaner data for batch 
 
 ## Makefile Targets
 
-Requires `make` (Git Bash). All targets are plain commands if `make` is not available.
+Requires `make` (Git Bash on Windows). All targets are plain `docker compose` / Python commands if `make` is not available.
 
 ```bash
-make init                # create data/ and airflow/logs directories (run once)
-make airflow-build       # build custom Airflow image for all services (run once after clone)
-make up                  # docker compose up -d
-make down                # stop containers (data volumes kept)
-make topics              # describe all Kafka topics
-make logs                # tail Kafka container logs
-make gen                 # run generator with .env settings
-make gen-load            # 500 events/sec, 5000 messages, seed=0
-make stream              # submit the Spark streaming job
-make batch D=YYYY-MM-DD  # run bronze→silver batch job for one date
-make trigger D=YYYY-MM-DD # trigger mfs_daily_pipeline DAG for a specific date
-make dbt-run             # run all dbt models (staging views + gold tables)
-make dbt-test            # run all dbt schema tests
-make dbt-docs            # generate dbt documentation (dbt/target/index.html)
-make reset               # wipe Kafka + Spark data volumes (asks for confirmation)
+make init                 # create data/ and airflow/logs directories (run once)
+make airflow-build        # build custom Airflow image for all services
+make up                   # docker compose up -d
+make down                 # stop containers (data volumes kept)
+make topics               # describe all Kafka topics
+make logs                 # tail Kafka container logs
+make gen                  # run generator with .env settings
+make gen-load             # 500 events/sec, 5000 messages, seed=0
+make stream               # submit the Spark streaming job
+make batch D=YYYY-MM-DD   # run bronze→silver batch job for one date
+make trigger D=YYYY-MM-DD # manually trigger mfs_daily_pipeline for a date
+make dbt-run              # run all dbt models
+make dbt-test             # run all dbt schema tests
+make dbt-docs             # generate dbt documentation
+make reset                # wipe all volumes and bronze/silver/quarantine files (destructive)
 ```
-
----
-
-## Build Milestones
-
-### Week 1 — Infrastructure + Ingestion
-- [x] `docker compose up` starts Kafka, Spark, and Kafka UI
-- [x] Topics `mfs.transactions` and `mfs.fraud_alerts` created automatically
-- [x] Generator produces events visible in Kafka UI at http://localhost:8090
-- [x] Kafka 4.3.2 KRaft mode (no ZooKeeper)
-
-### Week 2 — Spark Streaming
-- [x] Spark 3.5.3 standalone cluster running in Docker
-- [x] Streaming job: 3 queries (bronze + R1_VELOCITY + R2_LARGE_CASHOUT)
-- [ ] Bronze Parquet files verified under `ingest_date=` folders
-- [ ] Fraud alerts appear in `mfs.fraud_alerts` topic
-- [ ] Stop/restart test: no gaps, no reprocessed offsets (checkpoint verification)
-
-### Week 3 — Spark Batch + Airflow
-- [x] `bronze_to_silver.py` — parse, validate, quarantine, dedupe, write silver Parquet + PostgreSQL
-- [x] `sql/init_dw.sql` — `silver.transactions` (PK), `transactions_stage`, `batch_audit`, `fraud_alerts`
-- [x] PostgreSQL DW (`postgres-dw`) + Airflow in `docker-compose.yml`
-- [x] `mfs_daily_pipeline` DAG — wait_for_bronze → bronze_to_silver → load_silver → dbt_build → publish_audit
-- [ ] `silver.transactions` verified: no duplicate `txn_id`, audit arithmetic correct
-- [ ] Airflow DAG runs end-to-end for one day
-- [ ] Rerunning the same day leaves row counts unchanged (idempotency proof)
-
-### Week 4 — dbt + Superset
-- [x] dbt project scaffolded: `dbt_project.yml`, `profiles.yml`, `generate_schema_name` macro
-- [x] Staging model: `stg_transactions` (view over `silver.transactions`)
-- [x] Gold models: `daily_txn_summary`, `wallet_activity`, `district_heatmap` (tables in `gold` schema)
-- [x] Schema tests: `unique`, `not_null`, `accepted_values` on key columns — all pass
-- [x] dbt wired into Airflow `dbt_build` task (full path, `--no-use-colors`)
-- [ ] Apache Superset dashboards on gold tables
-- [ ] dbt lineage graph screenshot in this README
 
 ---
 
 ## References
 
-- [Project Specification](spec/mini-mfs-data-platform-spec.md) — full component specs, schema definitions, acceptance criteria
-- [Kafka Basics Reference](spec/kafka-basics-reference.md) — topics, partitions, offsets, consumer groups explained with Python examples
+- [Project Specification v1](spec/mini-mfs-data-platform-spec.md) — component specs, schema definitions, acceptance criteria
+- [Project Specification v2](spec/mini-mfs-data-platform-spec-v2.md) — planned enhancements (not yet implemented)
+- [Kafka Basics Reference](spec/kafka-basics-reference.md) — topics, partitions, offsets, consumer groups with Python examples

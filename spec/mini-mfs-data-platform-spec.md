@@ -1,6 +1,7 @@
 # Mini-MFS Transaction Data Platform — Project Specification
 
-**Version:** 1.0 (MVP)
+**Version:** 1.0 (MVP — implemented)
+**Next version:** see [mini-mfs-data-platform-spec-v2.md](mini-mfs-data-platform-spec-v2.md)
 **Purpose:** A hands-on learning project that covers the open-source data engineering core: **SQL, Python, Kafka, Spark, Airflow, dbt**. It is built around a realistic Mobile Financial Services (MFS) domain, similar to bKash or Nagad.
 **Runs on:** a single laptop with Docker Compose (16 GB RAM recommended).
 
@@ -469,8 +470,8 @@ One PostgreSQL instance, separate from Airflow's own metadata database.
 | Database | Schema | Contents | Built by |
 |---|---|---|---|
 | `mfs_dw` | `silver` | `transactions`, `transactions_stage`, `batch_audit`, `fraud_alerts` | Spark + SQL |
-| `mfs_dw` | `analytics_staging` | dbt staging views | dbt |
-| `mfs_dw` | `analytics` | Facts, dimensions, marts (gold) | dbt |
+| `mfs_dw` | `staging` | dbt staging views | dbt |
+| `mfs_dw` | `gold` | Aggregation tables and marts | dbt |
 
 ### 9.2 Silver table
 
@@ -526,112 +527,54 @@ Run the DAG twice for the same day: the row count of `silver.transactions` must 
 
 ## 10. Component 6: dbt project (silver → gold)
 
-**Folder:** `dbt/mfs_dbt/`
-**Adapter:** `dbt-postgres`
-**Run by:** Airflow (`dbt build`), or manually while developing.
+**Folder:** `dbt/`
+**Adapter:** `dbt-postgres==1.9.1`
+**Run by:** Airflow `dbt_build` task (`dbt build`), or manually with `make dbt-run`.
 
 ### 10.1 Layout
 
 ```
-models/
-  sources.yml                 # declares silver.transactions as a source
-  staging/
-    stg_transactions.sql      # view: rename, light cleanup
-    stg_transactions.yml      # tests
-  intermediate/
-    int_send_then_cashout.sql # pass-through pattern (rule R3, batch version)
-  marts/
-    dim_date.sql
-    dim_wallet.sql
-    dim_agent.sql
-    fct_transactions.sql      # incremental
-    mart_daily_volume_by_type.sql
-    mart_agent_liquidity.sql
-    mart_fraud_summary.sql
-    marts.yml                 # tests and docs
-tests/
-  assert_fee_not_greater_than_amount.sql
-macros/
+dbt/
+  dbt_project.yml
+  profiles.yml
+  macros/
+    generate_schema_name.sql    # outputs exact schema name (not public_gold)
+  models/
+    staging/
+      sources.yml               # declares silver.transactions as a dbt source
+      stg_transactions.sql      # view: thin wrapper, no business logic
+      schema.yml                # tests: unique, not_null, accepted_values
+    gold/
+      daily_txn_summary.sql     # table: volume by day + type
+      wallet_activity.sql       # table: lifetime stats per wallet
+      district_heatmap.sql      # table: volume by district + date + type
+      schema.yml                # column docs + tests
 ```
 
 ### 10.2 Models
 
-| Model | Materialization | Grain | Description |
-|---|---|---|---|
-| `stg_transactions` | view | 1 row per transaction | Selects from the source, standardises names. No business logic. |
-| `dim_date` | table | 1 row per calendar day | Date, day of week, month, is_weekend, Bangladesh weekend flag (Friday/Saturday). |
-| `dim_wallet` | table | 1 row per wallet | First seen, last seen, home district (most frequent), total transactions. |
-| `dim_agent` | table | 1 row per agent | District, first/last activity date. |
-| `fct_transactions` | **incremental** | 1 row per transaction | Keys to dimensions, amount, fee, type, channel. |
-| `mart_daily_volume_by_type` | table | 1 row per day per txn_type | Count, total amount, total fee, average amount. |
-| `mart_agent_liquidity` | table | 1 row per agent per day | Cash-in total, cash-out total, **net cash position** (cash-in − cash-out). Agents with a large negative net need e-money top-up. This is a real MFS operations question. |
-| `mart_fraud_summary` | table | 1 row per day per rule | Alert counts from streaming rules plus batch pass-through detections. |
+| Model | Schema | Materialization | Grain | Description |
+|---|---|---|---|---|
+| `stg_transactions` | `staging` | view | 1 row per transaction | Selects from `silver.transactions`. No business logic. |
+| `daily_txn_summary` | `gold` | table | 1 row per day per txn_type | Count, total/avg amount, total fee, unique senders, active districts. |
+| `wallet_activity` | `gold` | table | 1 row per wallet | Lifetime totals: sent count, total sent, total fee, avg amount, first/last date. |
+| `district_heatmap` | `gold` | table | 1 row per district per day per type | Transaction count and amounts for geographic analysis. |
 
-### 10.3 Incremental model with a late-data lookback
-
-```sql
--- models/marts/fct_transactions.sql
-{{ config(materialized='incremental', unique_key='txn_id') }}
-
-select
-    txn_id,
-    event_date,
-    event_time,
-    txn_type,
-    sender_wallet,
-    receiver_wallet,
-    agent_id,
-    merchant_id,
-    amount,
-    fee,
-    channel,
-    district,
-    processed_at
-from {{ ref('stg_transactions') }}
-
-{% if is_incremental() %}
-  -- reprocess the last 3 days so late-arriving rows are picked up
-  where processed_at > (select max(processed_at) - interval '3 days' from {{ this }})
-{% endif %}
-```
-
-`unique_key='txn_id'` makes dbt merge instead of append, so reprocessing the lookback window doesn't create duplicates.
-
-### 10.4 Pass-through detection (batch version of rule R3)
-
-```sql
--- models/intermediate/int_send_then_cashout.sql
-select
-    r.receiver_wallet           as wallet,
-    r.txn_id                    as received_txn_id,
-    c.txn_id                    as cashout_txn_id,
-    r.amount                    as received_amount,
-    c.amount                    as cashout_amount,
-    r.event_time                as received_at,
-    c.event_time                as cashed_out_at
-from {{ ref('stg_transactions') }} r
-join {{ ref('stg_transactions') }} c
-  on c.sender_wallet = r.receiver_wallet
- and c.txn_type = 'CASH_OUT'
- and c.event_time between r.event_time and r.event_time + interval '2 minutes'
- and c.amount >= 0.9 * r.amount
-where r.txn_type = 'SEND_MONEY'
-```
-
-### 10.5 Tests
+### 10.3 Schema tests
 
 | Model | Column | Test |
 |---|---|---|
 | `stg_transactions` | `txn_id` | `unique`, `not_null` |
 | `stg_transactions` | `txn_type` | `accepted_values` (5 values) |
-| `stg_transactions` | `amount` | `not_null` + custom: `> 0` |
-| `fct_transactions` | `agent_id` | `relationships` to `dim_agent` (where not null) |
-| `mart_agent_liquidity` | (agent_id, date) | unique combination (`dbt_utils.unique_combination_of_columns`) |
-| singular test | — | `assert_fee_not_greater_than_amount.sql` returns no rows |
+| `stg_transactions` | `sender_wallet`, `amount`, `event_date` | `not_null` |
+| `wallet_activity` | `wallet_id` | `unique`, `not_null` |
+| `daily_txn_summary`, `district_heatmap` | key columns | `not_null` |
 
-### 10.6 Documentation
+### 10.4 Documentation
 
-Add a description for every model and key column in the `.yml` files, then run `dbt docs generate` and `dbt docs serve`. Screenshot the lineage graph for your README.
+Run `dbt docs generate` and open `dbt/target/index.html` to view the lineage graph and column descriptions. Screenshot the lineage graph for the README.
+
+> **Version 2** adds: `fct_transactions` (incremental), `dim_date`, `dim_wallet`, `dim_agent`, `mart_agent_liquidity`, `mart_fraud_summary`, `int_send_then_cashout` (R3 pass-through), and `dbt_utils` package tests. See [spec v2](mini-mfs-data-platform-spec-v2.md).
 
 ---
 
@@ -700,11 +643,11 @@ Then open **http://localhost:8088**, add a PostgreSQL datasource pointing to `po
 
 | Chart | Gold table | Type |
 |---|---|---|
-| Daily transaction count and value by type | `mart_daily_volume_by_type` | Stacked bar |
-| App vs USSD share over time | `mart_daily_volume_by_type` | Line chart |
-| Top 10 agents by negative net cash position | `mart_agent_liquidity` | Table / bar |
-| Fraud alerts per day by rule | `mart_fraud_summary` | Line chart |
-| Data quality: rejected records by reason | quarantine table | Bar chart |
+| Transaction volume over time by type | `gold.daily_txn_summary` | Line chart |
+| Transaction count by type | `gold.daily_txn_summary` | Bar chart |
+| Top wallets by volume | `gold.wallet_activity` | Table (top 10, sort by `total_sent` DESC) |
+| Wallet segments | `gold.wallet_activity` | Scatter plot (`txn_sent_count` vs `total_sent`) |
+| District activity | `gold.district_heatmap` | Bar chart (`txn_count` by `district`) |
 
 ### 12.3 When to add
 
@@ -829,48 +772,43 @@ mini-mfs-data-platform/
 
 ### Week 3 — Batch and orchestration
 
-- [ ] `bronze_to_silver` produces silver Parquet and quarantine files for a given date.
-- [ ] `silver.transactions` has no duplicate `txn_id` (guaranteed by the primary key).
-- [ ] `batch_audit` row written for each run, and the numbers add up: `rows_read = rows_valid + rows_rejected` and `rows_valid − duplicates_removed = rows written to stage`.
-- [ ] Airflow DAG runs end to end for one day.
-- [ ] Rerunning the same day leaves row counts unchanged (idempotency).
-- [ ] Backfill of 3 days works.
+- [x] `bronze_to_silver` produces silver Parquet and quarantine files for a given date.
+- [x] `silver.transactions` has no duplicate `txn_id` (guaranteed by the primary key).
+- [x] `batch_audit` row written for each run with rows_read, rows_valid, rows_rejected, duplicates_removed.
+- [x] Airflow DAG runs end to end for one day (5 tasks).
+- [x] Rerunning the same day leaves row counts unchanged (idempotency via `ON CONFLICT DO NOTHING`).
+- [ ] Backfill of 3 days works. *(verify manually)*
 
 ### Week 4 — dbt, serving and documentation
 
-- [ ] All models build; all tests pass.
-- [ ] `fct_transactions` row count equals `silver.transactions` row count.
-- [ ] Pass-through detections appear in `mart_fraud_summary`.
-- [ ] dbt docs generated; lineage screenshot in README.
-- [ ] Dashboard with at least 3 cards (optional).
-- [ ] README explains the architecture and the main design decisions.
+- [x] All dbt models build (`stg_transactions`, `daily_txn_summary`, `wallet_activity`, `district_heatmap`).
+- [x] All schema tests pass (unique, not_null, accepted_values).
+- [x] dbt wired into Airflow `dbt_build` task — full pipeline runs end to end.
+- [x] Apache Superset running on port 8088 with mfs_dw connection pre-registered.
+- [x] Dashboard charts built on gold tables.
+- [ ] `dbt docs generate` run; lineage screenshot added to README.
+- [ ] README explains main design decisions.
+
+> Items moved to v2: `fct_transactions` incremental, dimensional models, `mart_agent_liquidity`, `mart_fraud_summary`, R3 pass-through, pytest unit tests. See [spec v2](mini-mfs-data-platform-spec-v2.md).
 
 ---
 
 ## 16. Testing and verification
 
-### 16.1 Unit tests (PySpark, pytest)
-
-For `bronze_to_silver`, build a small DataFrame in the test containing:
-
-- two copies of the same `txn_id` → expect 1 row in silver;
-- one row with `amount = -5` → expect it in quarantine with `INVALID_AMOUNT`;
-- one row with invalid JSON → expect `PARSE_ERROR`;
-- one late row (event_time 2 days before ingest) → expect it in silver with the correct `event_date`.
-
-### 16.2 Data checks (SQL)
+### 16.1 Data checks (SQL)
 
 ```sql
 -- 1. No duplicates in silver (should return 0 rows)
 SELECT txn_id, COUNT(*) FROM silver.transactions GROUP BY txn_id HAVING COUNT(*) > 1;
 
--- 2. Fact table matches silver
-SELECT (SELECT COUNT(*) FROM silver.transactions) AS silver_rows,
-       (SELECT COUNT(*) FROM analytics.fct_transactions) AS fact_rows;
-
--- 3. Audit arithmetic for each run
+-- 2. Audit arithmetic for each run (should return 0 rows)
 SELECT * FROM silver.batch_audit
 WHERE rows_read <> rows_valid + rows_rejected;
+
+-- 3. Gold tables populated
+SELECT COUNT(*) FROM gold.daily_txn_summary;
+SELECT COUNT(*) FROM gold.wallet_activity;
+SELECT COUNT(*) FROM gold.district_heatmap;
 ```
 
 ### 16.3 Idempotency test

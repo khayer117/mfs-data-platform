@@ -1,3 +1,16 @@
+# ── Superset common anchor ───────────────────────────────────────────────────
+x-superset-common: &superset-common
+  image: apache/superset:4.0.2
+  environment:
+    SUPERSET_SECRET_KEY: "mfs-superset-secret-change-in-prod"
+    PYTHONPATH: /app/pythonpath
+  volumes:
+    - superset-data:/app/superset_home
+    - ./superset/superset_config.py:/app/pythonpath/superset_config.py
+  depends_on:
+    postgres-dw:
+      condition: service_healthy
+
 # ── Airflow common anchor ────────────────────────────────────────────────────
 # All Airflow services inherit from this anchor.
 # Image is built from airflow/Dockerfile (adds Java + PySpark to official image).
@@ -248,8 +261,43 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  # ── Superset — initialise DB + admin + register mfs_dw (runs once) ─────────
+  superset-init:
+    <<: *superset-common
+    container_name: superset-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        superset db upgrade
+        superset fab create-admin --username admin --firstname Admin --lastname User --email admin@example.com --password admin123 || true
+        superset init
+        superset set_database_uri -d "MFS Data Warehouse" -u "postgresql+psycopg2://mfs:mfs@postgres-dw:5432/mfs_dw" || true
+    restart: on-failure
+
+  # ── Superset — web UI (http://localhost:8088) ────────────────────────────
+  superset:
+    <<: *superset-common
+    container_name: superset
+    ports:
+      - "8088:8088"
+    restart: always
+    depends_on:
+      postgres-dw:
+        condition: service_healthy
+      superset-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
 volumes:
   kafka-data:
   spark-packages:         # Maven/Ivy JAR cache for Spark packages
   postgres-dw-data:       # MFS data warehouse data
   postgres-airflow-data:  # Airflow metadata database
+  superset-data:          # Superset metadata (charts, dashboards, users)
