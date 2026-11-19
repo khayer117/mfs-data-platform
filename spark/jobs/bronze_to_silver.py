@@ -65,6 +65,8 @@ spark = (SparkSession.builder
     .config("spark.sql.session.timeZone", "UTC")
     # dynamic overwrite: only replace event_date partitions that this run touches
     .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
+    # use raw local filesystem to avoid Hadoop .crc checksum files on Windows bind mounts
+    .config("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.RawLocalFileSystem")
     .getOrCreate())
 
 spark.sparkContext.setLogLevel("WARN")
@@ -151,19 +153,27 @@ print(f"      rows_rejected = {rows_rejected}")
 
 # ---------------------------------------------------------------------------
 # 4. Write quarantine (rejected records with reject_reason column)
+#    Written as JSON lines via Python native I/O to avoid Hadoop _temporary
+#    staging issues on Windows Docker bind mounts.
 # ---------------------------------------------------------------------------
 if rows_rejected > 0:
+    import os
+    import json as _json
     quarantine_path = f"{LAKE_BASE}/quarantine/transactions/ingest_date={INGEST_DATE}"
-    (rejected
+    os.makedirs(quarantine_path, exist_ok=True)
+    quarantine_file = f"{quarantine_path}/rejected_{BATCH_RUN_ID}.jsonl"
+    rows = (rejected
         .select(
             "raw_value", "reject_reason",
             "txn_id", "txn_type", "amount",
             "kafka_partition", "kafka_offset", "kafka_timestamp",
         )
-        .write
-        .mode("overwrite")
-        .parquet(quarantine_path))
-    print(f"[4] Quarantine written: {quarantine_path}  ({rows_rejected} rows)")
+        .toJSON()
+        .collect())
+    with open(quarantine_file, "w") as f:
+        for row in rows:
+            f.write(row + "\n")
+    print(f"[4] Quarantine written: {quarantine_file}  ({rows_rejected} rows)")
 else:
     print("[4] No rejected records — quarantine skipped")
 

@@ -42,7 +42,7 @@ gen-load:
 ## Submit the Spark streaming job (runs continuously — Ctrl+C to stop)
 ## First run downloads the Kafka connector JAR (~10 MB, cached in spark-packages volume)
 stream:
-	docker compose exec spark-master /opt/spark/bin/spark-submit \
+	MSYS_NO_PATHCONV=1 docker compose exec spark-master /opt/spark/bin/spark-submit \
 	  --master spark://spark-master:7077 \
 	  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3 \
 	  --py-files /opt/spark-jobs/schemas.py \
@@ -51,8 +51,9 @@ stream:
 ## Run the bronze→silver batch job for a specific date (D=YYYY-MM-DD required)
 ## Example: make batch D=2026-11-09
 batch:
-	docker compose exec spark-master /opt/spark/bin/spark-submit \
-	  --master spark://spark-master:7077 \
+	MSYS_NO_PATHCONV=1 docker compose exec airflow-scheduler \
+	  /home/airflow/.local/bin/spark-submit \
+	  --master local[2] \
 	  --packages org.postgresql:postgresql:42.7.3 \
 	  --py-files /opt/spark-jobs/schemas.py \
 	  /opt/spark-jobs/bronze_to_silver.py \
@@ -83,8 +84,8 @@ dbt-docs:
 airflow-build:
 	docker compose build airflow-apiserver airflow-scheduler airflow-triggerer airflow-dag-processor
 
-## Full reset: stop containers, wipe Kafka volume, checkpoints, and bronze files (destructive)
-## Use after manually clearing Kafka so checkpoints and offsets stay in sync.
+## Full reset: stop all containers and wipe ALL Docker volumes (Kafka, PostgreSQL, Airflow, Superset)
+## Also removes local checkpoints and all lake files. Completely destructive — start from scratch.
 reset:
 	@read -p "Delete Kafka data, checkpoints, and bronze files? (yes/no): " ans && [ "$$ans" = "yes" ]
 	docker compose down -v

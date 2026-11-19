@@ -219,6 +219,8 @@ After bronze files exist for a date, run the bronze → silver batch job:
 make batch D=2026-11-09
 ```
 
+The batch job runs in `local[2]` mode (Spark embedded inside the container) so it does not compete with the streaming job for cluster resources. If the streaming job is running, the batch still executes without interference.
+
 Verify results in PostgreSQL (DBeaver, psql, or any SQL client at `localhost:5432`):
 
 ```sql
@@ -401,7 +403,7 @@ make trigger D=YYYY-MM-DD # manually trigger mfs_daily_pipeline for a date
 make dbt-run              # run all dbt models
 make dbt-test             # run all dbt schema tests
 make dbt-docs             # generate dbt documentation
-make reset                # wipe all volumes and bronze/silver/quarantine files (destructive)
+make reset                # wipe ALL Docker volumes + local lake files (Kafka, PostgreSQL, Airflow, Superset — fully destructive)
 ```
 
 ---
